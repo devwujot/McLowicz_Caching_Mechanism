@@ -6,63 +6,70 @@ Mentioned problem carry many narrow cases that need to be firstly deeply conside
 
 Narrow cases that need to be handled by the off line caching mechanism "under the table":
 
-## 1) User launched the app for the first time without Internet connection -> there is no data locally.
+
+
+#### 1) User launched the app for the first time without Internet connection -> there is no data locally.
 
 App firstly try to find the data in the local database. As we know in this particular example there is no data. Secondly, the app will try to fetch data from the network rest api. System will throw exceptions that need to be handled.
 
-## 2) User launched the app for the first time with the Internet connection -> no local data.
+#### 2) User launched the app for the first time with the Internet connection -> no local data.
 
 As we know from the previous stage there is no data in the local database yet. System, this time successfully retrieve Internet connection and receive payload data from the rest api. Fetched data is immediately saved into the local database and displayed to the UI. By the time of the fetching the loading state occurs that also should be considered.
 
-##   3) User launched the app on time with an Internet connection -> local data cache.
+#### 3) User launched the app on time with an Internet connection -> local data cache.
 
 System found data locally and immediately displayed it to the user. Under the table in the background, the system should fetch data from the remote source and implemented logic should decide which item needs to be overwritten.
 
-##   4) User lost Internet connection -> local data cache.
+#### 4) User lost Internet connection -> local data cache.
 
 System retrieves data from the local database. In the background it will try to synchronize data with the rest api with a nice and smooth way that will not disturb a user experience.
 
-## 5) Caching strategy.
+#### 5) Caching strategy.
 
 Logical algorithm for making decisions of which item should be overwritten in the local database.
 
-## NetworkBoundResource
 
-The idea of the NetworkBoundResource helper function is to observe the database for the resource type object. If there is no resource locally then the algorithm will switch to the next stage and it will try to fetch data from the network. Successfully fetched data is immediately saved into the local database and triggers the stream of resources to the UI. In the scenario where network connection is off or it is broken network bound resource algorithm will return resource object with the handled error.
 
 
 ## NetworkBoundResource
 
 The idea of the **NetworkBoundResource** helper function is to observe the database for the resource type object. If there is no resource locally then the algorithm will switch to the next stage and it will try to fetch data from the network. Successfully fetched data is immediately saved into the local database and triggers the stream of resources to the UI. In the scenario where network connection is off or it is broken network bound resource algorithm will return resource object with the handled error.
 
+
+
+![image info](./img/network_bound_resource.png)
+
+
+
 Deeper look at the NetworkBoundResource algorithm.
 
 
-	inline fun <ResultType, RequestType> networkBoundResource(  
-	    crossinline query: () -> Flow<ResultType>,  
-	    crossinline fetch: suspend () -> RequestType,  
-	    crossinline saveFetchResult: suspend (RequestType) -> Unit,  
-	    crossinline shouldFetch: (ResultType) -> Boolean = { true }  
-	) = flow {  
-	  val data = query().first()  
-	  
-	  val flow = if (shouldFetch(data)) {  
-	        // display cache data while loading new one from the api  
-	  emit(Resource.Loading(data))  
-	        try {  
-	            // save fetched data into local db  
-		  saveFetchResult(fetch())  
-	            // display fetched data from the local db  
-		  query().map { Resource.Success(it) }  
-	  } catch (throwable: Throwable) {  
-	          // pass error and display cache data from the local db  
-		  query().map { Resource.Error(throwable, it) }  
-	  }  
-	    } else {  
-	        query().map { Resource.Success(it) }  
-	  }  
-		emitAll(flow)  
-	}
+```kotlin
+inline fun <ResultType, RequestType> networkBoundResource(  
+    crossinline query: () -> Flow<ResultType>,  
+    crossinline fetch: suspend () -> RequestType,  
+    crossinline saveFetchResult: suspend (RequestType) -> Unit,  
+    crossinline shouldFetch: (ResultType) -> Boolean = { true }  
+) = flow {  
+  val data = query().first()  
+  val flow = if (shouldFetch(data)) {  
+      // display cache data while loading new one from the api  
+      emit(Resource.Loading(data))  
+            try {  
+                // save fetched data into local db  
+                saveFetchResult(fetch())  
+                // display fetched data from the local db  
+                query().map { Resource.Success(it) }  
+      		} catch (throwable: Throwable) {  
+              // pass error and display cache data from the local db  
+          	query().map { Resource.Error(throwable, it) }  
+      		}  
+        } else {  
+            query().map { Resource.Success(it) }  
+      }  
+        emitAll(flow)  
+}
+```
 
 
 It implements four methods:  
@@ -74,7 +81,86 @@ It implements four methods:
 
 The algorithm will handle complex problems in the background returning a LiveData object that can be observed for any data changes.  
 
-The example project uses NetworkBoundResource algorithm and the following ingredients to fulfill off line app mechanism requirements recommended nowadays by the **Google** in 2021:
+
+
+## Resource generic class
+
+As it was mentioned above network bound resource request should expose the state and the data. **Resource** generic handy class released by the Google will solved this problem for us.
+
+
+
+```kotlin
+// A generic class that contains data and status about loading this data.
+sealed class Resource<T>(
+   val data: T? = null,
+   val message: String? = null
+) {
+   class Success<T>(data: T) : Resource<T>(data)
+   class Loading<T>(data: T? = null) : Resource<T>(data)
+   class Error<T>(message: String, data: T? = null) : Resource<T>(data, message)
+}
+```
+
+
+
+## Usage
+
+**Simple** trigger the  function according to the app architecture by the **Google** from the viewModel with the **.asLiveData()** extension ready to be observed.
+
+
+
+```kotlin
+@HiltViewModel
+class McLowiczViewModel @Inject constructor(
+        repository: McLowiczRepository
+) : ViewModel() {
+    val dishes = repository.getDishes().asLiveData()
+}
+```
+
+
+
+## App architecture
+
+
+
+**Google** recommend to develop android apps under the **Single Source of Thruth** paradigm called **repository pattern**. So, basically all magic by the **Network Bound Resource** is happening in the repository class.
+
+
+
+```kotlin
+class McLowiczRepository @Inject constructor(
+        private val api: McLowiczApi,
+        private val db: McLowiczDatabase
+) {
+
+    private val mcLowiczDao = db.mcLowiczDao()
+
+    fun getDishes() = networkBoundResource(
+            query = {
+                mcLowiczDao.getAllDishes()
+            },
+            fetch = {
+                delay(2000)
+                api.getDishes()
+            },
+            saveFetchResult = { dishes ->
+                db.withTransaction {
+                    mcLowiczDao.deleteAllDishes()
+                    mcLowiczDao.insertDishes(dishes)
+                }
+            }
+    )
+}
+```
+
+![image info](./img/app_architecture.png)
+
+
+
+
+
+The example project uses NetworkBoundResource algorithm, app architecture and the following ingredients to fulfill off line app mechanism requirements recommended nowadays by the **Google** in 2021:
 
 - Kotlin  
 - Dagger Hilt  
